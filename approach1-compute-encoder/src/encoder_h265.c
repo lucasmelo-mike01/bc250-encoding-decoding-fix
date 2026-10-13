@@ -84,6 +84,9 @@ static bool is_live_caller(void)
             strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
             strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
             strcmp(program_invocation_short_name, "gamescope") == 0 ||
+            strcmp(program_invocation_short_name, "obs") == 0 ||
+            strcmp(program_invocation_short_name, "obs-studio") == 0 ||
+            strstr(program_invocation_short_name, "obs") != NULL ||
             strstr(program_invocation_short_name, "sunshine") != NULL ||
             strstr(program_invocation_short_name, "steam") != NULL ||
             strstr(program_invocation_short_name, "wivrn") != NULL ||

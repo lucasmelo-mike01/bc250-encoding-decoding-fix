@@ -997,10 +997,14 @@ static hevc_mv_t FUNC(motion_search)(const hevc_encoder_t *enc, int cu_x, int cu
     }
 
     /* Downhill, one sample at a time, within the search range. The point
-     * a step came from is not costed again: it was the worse of the two. */
+     * a step came from is not costed again: it was the worse of the two.
+     * When GPU Motion Estimation is active on the 40 CUs, the initial vector
+     * is already close to optimal: limit the search steps to immediate
+     * local polish (2 steps) instead of a 32-step CPU crawl. */
     const int cx0 = bx, cy0 = by;
     int back = -1;
-    for (int step = 0; step < 32; step++) {
+    const int max_downhill = enc->enable_gpu_me ? 2 : 32;
+    for (int step = 0; step < max_downhill; step++) {
         static const int ddx[4] = { -1, 1, 0, 0 }, ddy[4] = { 0, 0, -1, 1 };
         int nbx = bx, nby = by, nk = -1;
         for (int k = 0; k < 4; k++) {
@@ -1271,6 +1275,25 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
     memcpy(cd.res.rec_cb, pcb, sizeof(pcb));
     memcpy(cd.res.rec_cr, pcr, sizeof(pcr));
     TRY(CU_SKIP, FUNC(pred_dist)(enc, cu_x, cu_y, py, pcb, pcr), cand[best_merge], 0);
+
+    /* GPU-informed Early Skip: if the 40-CU Vulkan shader already detected
+     * that this 8x8 block is a static background (zero vector and SAD <= 96),
+     * its residual quantizes to zero. Skip all remaining CPU transforms and RDO. */
+    if (enc->enable_gpu_me && enc->gpu_mvs && enc->num_gpu_mvs > 0) {
+        uint32_t stride_cus = enc->coded_width / HEVC_CU_SIZE;
+        uint32_t cu_idx = (uint32_t)cuy * stride_cus + (uint32_t)cux;
+        if (cu_idx < enc->num_gpu_mvs) {
+            const gpu_mv_t *gmv = &enc->gpu_mvs[cu_idx];
+            if (gmv->sad <= 96 && gmv->mvx == 0 && gmv->mvy == 0) {
+                cd.kind = CU_SKIP;
+                memset(cd.res.cbf_y, 0, sizeof(cd.res.cbf_y));
+                cd.res.cbf_y8 = 0;
+                cd.res.cbf_cb = cd.res.cbf_cr = 0;
+                *d = cd;
+                goto decided;
+            }
+        }
+    }
 
     /* Merge with its residual - unless there is none, which is the skip -
      * as four 4x4 transforms and as one 8x8. */
