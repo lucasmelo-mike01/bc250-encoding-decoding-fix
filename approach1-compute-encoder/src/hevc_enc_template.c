@@ -1290,12 +1290,22 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
      * residual, and without it. */
     hevc_mv_t mvp[2];
     derive_amvp_candidates(y_min / HEVC_CU_SIZE, enc, cux, cuy, mvp);
-    hevc_mv_t starts[10];
+    hevc_mv_t starts[12];
     int n_starts = 0;
     starts[n_starts++] = mvp[0];
     starts[n_starts++] = mvp[1];
     for (int i = 0; i < 5; i++) starts[n_starts++] = cand[i];
     starts[n_starts].x = 0; starts[n_starts].y = 0; n_starts++;
+    if (enc->enable_gpu_me && enc->gpu_mvs && enc->num_gpu_mvs > 0) {
+        uint32_t stride_cus = enc->coded_width / HEVC_CU_SIZE;
+        uint32_t cu_idx = (uint32_t)cuy * stride_cus + (uint32_t)cux;
+        if (cu_idx < enc->num_gpu_mvs) {
+            /* GPU motion estimation produces integer pixel vectors: convert to 1/4 pel */
+            starts[n_starts].x = (int16_t)(enc->gpu_mvs[cu_idx].mvx << 2);
+            starts[n_starts].y = (int16_t)(enc->gpu_mvs[cu_idx].mvy << 2);
+            n_starts++;
+        }
+    }
     int mvp_idx = 0;
     int64_t me_cost;
     uint32_t me_sad;

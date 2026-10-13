@@ -1628,6 +1628,21 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         ctx->motion_est_pipeline = create_compute_pipeline(ctx->device, me_shader, ctx->motion_est_layout);
         vkDestroyShaderModule(ctx->device, me_shader, NULL);
     }
+    VkShaderModule hevc_me_shader = load_spirv_shader(ctx->device, "hevc_motion_estimation.comp.spv");
+    if (hevc_me_shader) {
+        ctx->hevc_me_pipeline = create_compute_pipeline(ctx->device, hevc_me_shader, ctx->motion_est_layout);
+        vkDestroyShaderModule(ctx->device, hevc_me_shader, NULL);
+    }
+    VkShaderModule hevc_trans_shader = load_spirv_shader(ctx->device, "hevc_transform.comp.spv");
+    if (hevc_trans_shader) {
+        ctx->hevc_transform_pipeline = create_compute_pipeline(ctx->device, hevc_trans_shader, ctx->transform_layout);
+        vkDestroyShaderModule(ctx->device, hevc_trans_shader, NULL);
+    }
+    VkShaderModule hevc_q_shader = load_spirv_shader(ctx->device, "hevc_quant.comp.spv");
+    if (hevc_q_shader) {
+        ctx->hevc_quant_pipeline = create_compute_pipeline(ctx->device, hevc_q_shader, ctx->quantize_layout);
+        vkDestroyShaderModule(ctx->device, hevc_q_shader, NULL);
+    }
     VkShaderModule predict_shader = load_spirv_shader(ctx->device, "residual_predict.comp.spv");
     if (predict_shader) {
         ctx->predict_pipeline = create_compute_pipeline(ctx->device, predict_shader, ctx->predict_layout);
@@ -1745,6 +1760,9 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     vkDeviceWaitIdle(ctx->device);
 
     if (ctx->motion_est_pipeline) vkDestroyPipeline(ctx->device, ctx->motion_est_pipeline, NULL);
+    if (ctx->hevc_me_pipeline) vkDestroyPipeline(ctx->device, ctx->hevc_me_pipeline, NULL);
+    if (ctx->hevc_transform_pipeline) vkDestroyPipeline(ctx->device, ctx->hevc_transform_pipeline, NULL);
+    if (ctx->hevc_quant_pipeline) vkDestroyPipeline(ctx->device, ctx->hevc_quant_pipeline, NULL);
     if (ctx->predict_pipeline) vkDestroyPipeline(ctx->device, ctx->predict_pipeline, NULL);
     if (ctx->transform_pipeline) vkDestroyPipeline(ctx->device, ctx->transform_pipeline, NULL);
     if (ctx->quantize_pipeline) vkDestroyPipeline(ctx->device, ctx->quantize_pipeline, NULL);
@@ -3520,6 +3538,70 @@ int gpu_compute_dispatch_me_only(gpu_context_t *ctx, gpu_image_t render_target, 
     return 0;
 }
 
+int gpu_compute_dispatch_hevc_me(gpu_context_t *ctx, gpu_image_t render_target, int width, int height) {
+    if (!ctx) return -1;
+    VkPipeline pipeline = ctx->hevc_me_pipeline ? ctx->hevc_me_pipeline : ctx->motion_est_pipeline;
+    if (!pipeline) return -1;
+
+    if (ctx->staging_buffers[0] == VK_NULL_HANDLE ||
+        ctx->frame_width != (uint32_t)width ||
+        ctx->frame_height != (uint32_t)height) {
+        if (allocate_encoding_buffers(ctx, (uint32_t)width, (uint32_t)height) != 0) {
+            return -1;
+        }
+    }
+
+    VkCommandBuffer cmd_buf = ctx->cmd_bufs[ctx->current_buf];
+    uint32_t width_cus = ((uint32_t)width + 7) / 8;
+    uint32_t height_cus = ((uint32_t)height + 7) / 8;
+
+    if (render_target.y_plane) {
+        transition_image_layout(cmd_buf, render_target.y_plane, render_target.current_layout, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    if (render_target.uv_plane) {
+        transition_image_layout(cmd_buf, render_target.uv_plane, render_target.current_layout, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    render_target.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+
+    uint32_t pc[8] = {
+        (uint32_t)width,
+        (uint32_t)height,
+        width_cus,
+        height_cus,
+        26, /* default QP */
+        16, /* search range */
+        0,
+        0
+    };
+
+    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->motion_est_layout, 0, 1, &ctx->me_desc_set, 0, NULL);
+    vkCmdPushConstants(cmd_buf, ctx->motion_est_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    vkCmdDispatch(cmd_buf, width_cus, height_cus, 1);
+    insert_compute_barrier(cmd_buf);
+
+    VkBufferCopy mv_copy_region = { .srcOffset = 0, .dstOffset = 0, .size = ctx->mv_staging_size };
+    vkCmdCopyBuffer(cmd_buf, ctx->mv_buffer, ctx->mv_staging_buffers[ctx->current_buf], 1, &mv_copy_region);
+
+    if (ctx->recon_image.y_plane && render_target.y_plane) {
+        transition_image_layout(cmd_buf, ctx->recon_image.y_plane, ctx->recon_image.current_layout, VK_IMAGE_LAYOUT_GENERAL);
+        ctx->recon_image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkImageCopy copy_region = {
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .srcOffset = { 0, 0, 0 },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .dstOffset = { 0, 0, 0 },
+            .extent = { (uint32_t)width, (uint32_t)height, 1 }
+        };
+        vkCmdCopyImage(cmd_buf, render_target.y_plane, VK_IMAGE_LAYOUT_GENERAL,
+                       ctx->recon_image.y_plane, VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region);
+        ctx->has_recon_frame = true;
+    }
+
+    return 0;
+}
+
 int gpu_compute_end_picture(gpu_context_t *ctx) {
     struct timespec e0, e1, s0, s1;
     if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &e0);
@@ -3862,4 +3944,51 @@ void gpu_compute_debug_dump_real_input(gpu_context_t *ctx, gpu_image_t *image, g
     free(y_buf);
     free(uv_buf);
     dump_frame_index++;
+}
+
+int gpu_compute_dispatch_hevc_transform(gpu_context_t *ctx, int num_blocks, int transform_size, int is_dst, int bit_depth) {
+    if (!ctx || num_blocks <= 0) return -1;
+    VkPipeline pipeline = ctx->hevc_transform_pipeline ? ctx->hevc_transform_pipeline : ctx->transform_pipeline;
+    if (!pipeline) return -1;
+
+    VkCommandBuffer cmd_buf = ctx->cmd_bufs[ctx->current_buf];
+    uint32_t pc[4] = {
+        (uint32_t)num_blocks,
+        (uint32_t)transform_size,
+        (uint32_t)is_dst,
+        (uint32_t)bit_depth
+    };
+
+    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->transform_layout, 0, 1, &ctx->dct_desc_set, 0, NULL);
+    vkCmdPushConstants(cmd_buf, ctx->transform_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    uint32_t workgroups = ((uint32_t)num_blocks + 63) / 64;
+    vkCmdDispatch(cmd_buf, workgroups, 1, 1);
+    insert_compute_barrier(cmd_buf);
+
+    return 0;
+}
+
+int gpu_compute_dispatch_hevc_quant(gpu_context_t *ctx, int num_blocks, int log2_size, int qp, int bit_depth) {
+    if (!ctx || num_blocks <= 0) return -1;
+    VkPipeline pipeline = ctx->hevc_quant_pipeline ? ctx->hevc_quant_pipeline : ctx->quantize_pipeline;
+    if (!pipeline) return -1;
+
+    VkCommandBuffer cmd_buf = ctx->cmd_bufs[ctx->current_buf];
+    uint32_t pc[5] = {
+        (uint32_t)num_blocks,
+        (uint32_t)log2_size,
+        (uint32_t)qp,
+        (uint32_t)bit_depth,
+        0 /* default deadzone offset */
+    };
+
+    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->quantize_layout, 0, 1, &ctx->quant_desc_set, 0, NULL);
+    vkCmdPushConstants(cmd_buf, ctx->quantize_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    uint32_t workgroups = ((uint32_t)num_blocks + 63) / 64;
+    vkCmdDispatch(cmd_buf, workgroups, 1, 1);
+    insert_compute_barrier(cmd_buf);
+
+    return 0;
 }

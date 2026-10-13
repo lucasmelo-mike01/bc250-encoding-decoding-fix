@@ -1,0 +1,103 @@
+/*
+ * Copyright (c) 2026 BC-250 Project
+ * SPDX-License-Identifier: GPL-3.0-only
+ *
+ * hevc_quant.comp - Dedicated Vulkan Compute Quantization & Dequantization for HEVC (H.265)
+ *
+ * Conforming to ITU-T Rec. H.265 Section 8.6.3:
+ * - Forward Quantization with deadzone scaling
+ * - Inverse Quantization (Dequantization) for reconstruction loop
+ * - Level scale mapping for QP [0..51]: level_scale[qp % 6] << (qp / 6)
+ * - Computes Coded Block Flags (CBF) and non-zero coefficient counts
+ */
+
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+layout(local_size_x = 64) in; // Wave64
+
+// Buffer 0: Transformed coefficients input (int16)
+layout(std430, set = 0, binding = 0) readonly buffer TransformedCoeffs {
+    int in_coeffs[];
+};
+
+// Buffer 1: Quantized levels output for CABAC (int16)
+layout(std430, set = 0, binding = 1) writeonly buffer QuantizedLevels {
+    int out_levels[];
+};
+
+// Buffer 2: Dequantized coefficients for Reconstruction (int16)
+layout(std430, set = 0, binding = 2) writeonly buffer DequantizedCoeffs {
+    int out_dequant[];
+};
+
+// Buffer 3: CBF flags per transform block (1 uint per block: 1 if any non-zero, 0 if all zero)
+layout(std430, set = 0, binding = 3) writeonly buffer BlockCBF {
+    uint out_cbf[];
+};
+
+layout(push_constant) uniform QuantPushConstants {
+    uint num_blocks;       // Total blocks
+    uint log2_size;        // 2 for 4x4, 3 for 8x8, 4 for 16x16
+    uint qp;               // Quantization parameter (0..51)
+    uint bit_depth;        // Bit depth (8 or 10)
+    uint deadzone_offset;  // Deadzone offset (typically add = (1 << shift) / 3 or / 2)
+} pcs;
+
+// ITU-T H.265 Table 8-15: levelScale[m] = { 40, 45, 51, 57, 64, 72 }
+const int LEVEL_SCALE[6] = { 40, 45, 51, 57, 64, 72 };
+
+// Reciprocal scale for forward quantization: round( (1 << 14) / LEVEL_SCALE[m] )
+const int INV_LEVEL_SCALE[6] = { 410, 364, 321, 287, 256, 228 };
+
+int clip16(int v) {
+    return clamp(v, -32768, 32767);
+}
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pcs.num_blocks) return;
+
+    uint block_elements = 1 << (pcs.log2_size * 2); // 16 for 4x4, 64 for 8x8
+    uint block_offset = block_idx * block_elements;
+
+    int qp_rem = int(pcs.qp % 6);
+    int qp_per = int(pcs.qp / 6);
+
+    // Forward quant parameters
+    int q_shift = 14 + qp_per;
+    int q_add = int(pcs.deadzone_offset);
+    if (q_add == 0) q_add = 1 << (q_shift - 1);
+
+    // Inverse quant parameters (8.6.3)
+    int dq_shift = int(pcs.bit_depth) + int(pcs.log2_size) - 5;
+    int dq_add = (dq_shift > 0) ? (1 << (dq_shift - 1)) : 0;
+    int dq_scale = LEVEL_SCALE[qp_rem] << qp_per;
+
+    uint has_nonzero = 0;
+
+    for (uint i = 0; i < block_elements; i++) {
+        int coeff = in_coeffs[block_offset + i];
+        int sign = (coeff < 0) ? -1 : 1;
+        int abs_c = abs(coeff);
+
+        // Forward quantization
+        int level = (abs_c * INV_LEVEL_SCALE[qp_rem] + q_add) >> q_shift;
+        level = level * sign;
+        out_levels[block_offset + i] = level;
+
+        if (level != 0) {
+            has_nonzero = 1;
+        }
+
+        // Dequantization
+        int dq_val = 0;
+        if (level != 0) {
+            int64_t v = (int64_t(level) * int64_t(dq_scale) * 16L + int64_t(dq_add)) >> dq_shift;
+            dq_val = clip16(int(v));
+        }
+        out_dequant[block_offset + i] = dq_val;
+    }
+
+    out_cbf[block_idx] = has_nonzero;
+}

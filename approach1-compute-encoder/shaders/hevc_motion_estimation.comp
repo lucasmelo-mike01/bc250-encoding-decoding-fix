@@ -1,0 +1,178 @@
+/*
+ * Copyright (c) 2026 BC-250 Project
+ * SPDX-License-Identifier: GPL-3.0-only
+ *
+ * hevc_motion_estimation.comp - Dedicated Vulkan Compute Motion Estimation for HEVC (H.265)
+ *
+ * Designed specifically for AMD BC-250 (Cyan Skillfish / RDNA 1.5):
+ * - Operates directly on 8x8 HEVC Coding Units (HEVC_CU_SIZE = 8).
+ * - Workgroup size: 64 threads (Wave64 native execution on RDNA CU).
+ * - Fast zero-motion check with early exit for static background regions.
+ * - Hierarchical 2D diamond search across a +/- 16 sample search window.
+ * - Emits integer motion vectors (MVx, MVy) and SAD values into a structured storage buffer
+ *   to serve as GPU-accelerated predictor seeds for the CPU rate-distortion decision.
+ */
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 64) in; // Wave64 (1 RDNA SIMD wave per workgroup)
+
+layout(set = 0, binding = 0, r8) uniform readonly image2D currentImage;
+layout(set = 0, binding = 1, r8) uniform readonly image2D referenceImage;
+
+struct HevcMotionVector {
+    int mvx;
+    int mvy;
+    uint sad;
+    uint flags;
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer OutputMVs {
+    HevcMotionVector cu_mvs[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint frame_width;
+    uint frame_height;
+    uint width_in_cus;   // ceil(frame_width / 8)
+    uint height_in_cus;  // ceil(frame_height / 8)
+    uint qp;
+    uint search_range;   // default 16
+} pcs;
+
+// 8x8 current CU loaded in shared memory (64 samples, 1 per thread)
+shared uint s_curr_cu[8][8];
+
+// Search window for +/-16 search radius around an 8x8 block:
+// Dimension = 8 + 32 = 40x40 samples = 1600 samples
+shared uint s_ref_window[40][40];
+
+shared uint s_subgroup_sad[4];
+shared uint s_thread_sad[64];
+
+shared ivec2 s_best_mv;
+shared uint s_best_sad;
+
+uint reduce_sad(uint val) {
+#if defined(GL_KHR_shader_subgroup_arithmetic)
+    uint sub_sum = subgroupAdd(val);
+    if (subgroupElect()) {
+        s_subgroup_sad[gl_SubgroupID] = sub_sum;
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0) {
+        uint total = 0;
+        for (uint i = 0; i < gl_NumSubgroups; i++) {
+            total += s_subgroup_sad[i];
+        }
+        s_subgroup_sad[0] = total;
+    }
+    barrier();
+    return s_subgroup_sad[0];
+#else
+    s_thread_sad[gl_LocalInvocationIndex] = val;
+    barrier();
+    if (gl_LocalInvocationIndex < 32) s_thread_sad[gl_LocalInvocationIndex] += s_thread_sad[gl_LocalInvocationIndex + 32];
+    barrier();
+    if (gl_LocalInvocationIndex < 16) s_thread_sad[gl_LocalInvocationIndex] += s_thread_sad[gl_LocalInvocationIndex + 16];
+    barrier();
+    if (gl_LocalInvocationIndex < 8)  s_thread_sad[gl_LocalInvocationIndex] += s_thread_sad[gl_LocalInvocationIndex + 8];
+    barrier();
+    if (gl_LocalInvocationIndex < 4)  s_thread_sad[gl_LocalInvocationIndex] += s_thread_sad[gl_LocalInvocationIndex + 4];
+    barrier();
+    if (gl_LocalInvocationIndex < 2)  s_thread_sad[gl_LocalInvocationIndex] += s_thread_sad[gl_LocalInvocationIndex + 2];
+    barrier();
+    if (gl_LocalInvocationIndex == 0) s_thread_sad[0] += s_thread_sad[1];
+    barrier();
+    return s_thread_sad[0];
+#endif
+}
+
+// Early termination threshold for static 8x8 block (~1.5 intensity delta per sample)
+const uint STATIC_CU_THRESHOLD = 96;
+
+void main() {
+    uint cu_x = gl_WorkGroupID.x;
+    uint cu_y = gl_WorkGroupID.y;
+
+    if (cu_x >= pcs.width_in_cus || cu_y >= pcs.height_in_cus) return;
+
+    uint cu_idx = cu_y * pcs.width_in_cus + cu_x;
+    uint tid = gl_LocalInvocationIndex;
+    ivec2 cu_origin = ivec2(int(cu_x * 8), int(cu_y * 8));
+
+    // 1. Cooperative load of current 8x8 CU (64 threads = 1 pixel per thread)
+    uint px = tid % 8;
+    uint py = tid / 8;
+    ivec2 curr_coord = cu_origin + ivec2(int(px), int(py));
+    curr_coord = clamp(curr_coord, ivec2(0), ivec2(int(pcs.frame_width) - 1, int(pcs.frame_height) - 1));
+    s_curr_cu[py][px] = uint(round(imageLoad(currentImage, curr_coord).r * 255.0));
+
+    // 2. Cooperative load of 40x40 reference window (1600 samples / 64 threads = 25 loads/thread)
+    for (uint i = 0; i < 25; i++) {
+        uint s_idx = tid * 25 + i;
+        if (s_idx < 1600) {
+            uint rx = s_idx % 40;
+            uint ry = s_idx / 40;
+            ivec2 ref_coord = cu_origin + ivec2(int(rx), int(ry)) - ivec2(16, 16);
+            ref_coord = clamp(ref_coord, ivec2(0), ivec2(int(pcs.frame_width) - 1, int(pcs.frame_height) - 1));
+            s_ref_window[ry][rx] = uint(round(imageLoad(referenceImage, ref_coord).r * 255.0));
+        }
+    }
+
+    barrier();
+
+    // 3. Fast Zero-Motion Check (SAD at (0, 0))
+    // Anchor center in 40x40 window is at offset (16, 16)
+    uint curr_val = s_curr_cu[py][px];
+    uint ref_val = s_ref_window[py + 16][px + 16];
+    uint diff_zero = (curr_val > ref_val) ? (curr_val - ref_val) : (ref_val - curr_val);
+    uint zero_sad = reduce_sad(diff_zero);
+
+    if (zero_sad <= STATIC_CU_THRESHOLD) {
+        if (tid == 0) {
+            cu_mvs[cu_idx].mvx = 0;
+            cu_mvs[cu_idx].mvy = 0;
+            cu_mvs[cu_idx].sad = zero_sad;
+            cu_mvs[cu_idx].flags = 1; // static flag
+        }
+        return;
+    }
+
+    if (tid == 0) {
+        s_best_mv = ivec2(0, 0);
+        s_best_sad = zero_sad;
+    }
+    barrier();
+
+    // 4. Hierarchical Diamond Search (radius 8, 4, 2, 1)
+    ivec2 diamond[4] = { ivec2(0, 1), ivec2(0, -1), ivec2(1, 0), ivec2(-1, 0) };
+
+    for (int step = 8; step >= 1; step /= 2) {
+        ivec2 center = s_best_mv;
+        for (int c = 0; c < 4; c++) {
+            ivec2 test_mv = center + diamond[c] * step;
+            if (abs(test_mv.x) > 16 || abs(test_mv.y) > 16) continue;
+
+            uint ref_s = s_ref_window[py + 16 + test_mv.y][px + 16 + test_mv.x];
+            uint diff = (curr_val > ref_s) ? (curr_val - ref_s) : (ref_s - curr_val);
+            uint cand_sad = reduce_sad(diff);
+
+            if (tid == 0 && cand_sad < s_best_sad) {
+                s_best_sad = cand_sad;
+                s_best_mv = test_mv;
+            }
+            barrier();
+        }
+    }
+
+    // Write final chosen motion vector
+    if (tid == 0) {
+        cu_mvs[cu_idx].mvx = s_best_mv.x;
+        cu_mvs[cu_idx].mvy = s_best_mv.y;
+        cu_mvs[cu_idx].sad = s_best_sad;
+        cu_mvs[cu_idx].flags = 0;
+    }
+}
