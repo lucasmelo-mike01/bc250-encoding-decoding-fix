@@ -131,6 +131,15 @@ typedef struct bc250_gpu_context {
     VkPipeline reconstruct_pipeline;
     VkPipeline intra_wavefront_pipeline;
 
+    /* Section 3.4 Audit Counters */
+    struct {
+        uint32_t me_dispatches;
+        uint32_t transform_dispatches;
+        uint32_t quant_dispatches;
+        uint32_t pred_dispatches;
+        uint32_t reconstruct_dispatches;
+    } hevc_counters;
+
     /* Descriptor sets */
     VkDescriptorSet me_desc_set;
     VkDescriptorSet predict_desc_set;

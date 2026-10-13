@@ -1769,6 +1769,14 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
 
     vkDeviceWaitIdle(ctx->device);
 
+    if (ctx->hevc_counters.me_dispatches > 0 || ctx->hevc_counters.transform_dispatches > 0) {
+        fprintf(stderr, "[bc250-audit] HEVC GPU Dispatches: ME=%u, Transform=%u, Quant=%u, Recon=%u\n",
+                ctx->hevc_counters.me_dispatches,
+                ctx->hevc_counters.transform_dispatches,
+                ctx->hevc_counters.quant_dispatches,
+                ctx->hevc_counters.reconstruct_dispatches);
+    }
+
     if (ctx->motion_est_pipeline) vkDestroyPipeline(ctx->device, ctx->motion_est_pipeline, NULL);
     if (ctx->hevc_me_pipeline) vkDestroyPipeline(ctx->device, ctx->hevc_me_pipeline, NULL);
     if (ctx->hevc_transform_pipeline) vkDestroyPipeline(ctx->device, ctx->hevc_transform_pipeline, NULL);
@@ -4015,6 +4023,17 @@ int gpu_compute_dispatch_hevc_pipeline(gpu_context_t *ctx, gpu_image_t render_ta
         }
     }
 
+    /* Ensure reconstructed reference frame image is allocated */
+    if (ctx->recon_image.y_plane == VK_NULL_HANDLE || ctx->recon_image.width != (uint32_t)width || ctx->recon_image.height != (uint32_t)height) {
+        if (ctx->recon_image.y_plane != VK_NULL_HANDLE) {
+            gpu_compute_destroy_image(ctx, ctx->recon_image, ctx->recon_memory);
+            ctx->recon_memory.mapped_ptr = NULL;
+            ctx->recon_memory.memory = VK_NULL_HANDLE;
+        }
+        gpu_compute_create_image(ctx, width, height, 0, &ctx->recon_image, &ctx->recon_memory);
+        ctx->has_recon_frame = false;
+    }
+
     VkCommandBuffer cmd_buf = ctx->cmd_bufs[ctx->current_buf];
     uint32_t width_cus = ((uint32_t)width + 7) / 8;
     uint32_t height_cus = ((uint32_t)height + 7) / 8;
@@ -4027,6 +4046,16 @@ int gpu_compute_dispatch_hevc_pipeline(gpu_context_t *ctx, gpu_image_t render_ta
         transition_image_layout(cmd_buf, render_target.uv_plane, render_target.current_layout, VK_IMAGE_LAYOUT_GENERAL);
     }
     render_target.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+
+    /* Bind reference image descriptor for Motion Estimation */
+    VkImageView ref_view = render_target.y_view;
+    if (ctx->has_recon_frame && ctx->recon_image.y_view != VK_NULL_HANDLE) {
+        ref_view = ctx->recon_image.y_view;
+    }
+    if (render_target.y_view) {
+        update_storage_image_descriptor(ctx->device, ctx->me_desc_set, 0, render_target.y_view);
+        update_storage_image_descriptor(ctx->device, ctx->me_desc_set, 1, ref_view);
+    }
 
     /* Stage 1: Motion Estimation (P-frames) */
     if (!is_idr && ctx->has_recon_frame) {
@@ -4041,6 +4070,7 @@ int gpu_compute_dispatch_hevc_pipeline(gpu_context_t *ctx, gpu_image_t render_ta
 
             VkBufferCopy mv_copy_region = { .srcOffset = 0, .dstOffset = 0, .size = ctx->mv_staging_size };
             vkCmdCopyBuffer(cmd_buf, ctx->mv_buffer, ctx->mv_staging_buffers[ctx->current_buf], 1, &mv_copy_region);
+            ctx->hevc_counters.me_dispatches++;
         }
     }
 
@@ -4054,6 +4084,7 @@ int gpu_compute_dispatch_hevc_pipeline(gpu_context_t *ctx, gpu_image_t render_ta
         uint32_t wg_trans = (total_cus + 63) / 64;
         vkCmdDispatch(cmd_buf, wg_trans, 1, 1);
         insert_compute_barrier(cmd_buf);
+        ctx->hevc_counters.transform_dispatches++;
     }
 
     /* Stage 3: Quantization */
@@ -4066,6 +4097,7 @@ int gpu_compute_dispatch_hevc_pipeline(gpu_context_t *ctx, gpu_image_t render_ta
         uint32_t wg_quant = (total_cus + 63) / 64;
         vkCmdDispatch(cmd_buf, wg_quant, 1, 1);
         insert_compute_barrier(cmd_buf);
+        ctx->hevc_counters.quant_dispatches++;
     }
 
     /* Stage 4: Reconstruction update */
@@ -4083,6 +4115,7 @@ int gpu_compute_dispatch_hevc_pipeline(gpu_context_t *ctx, gpu_image_t render_ta
         vkCmdCopyImage(cmd_buf, render_target.y_plane, VK_IMAGE_LAYOUT_GENERAL,
                        ctx->recon_image.y_plane, VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region);
         ctx->has_recon_frame = true;
+        ctx->hevc_counters.reconstruct_dispatches++;
     }
 
     return 0;

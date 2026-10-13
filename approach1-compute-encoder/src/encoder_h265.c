@@ -1903,23 +1903,25 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
         if (fit_to_surface(encoder, input_surface.width, input_surface.height) != 0) return -1;
 
         /* Dedicated HEVC GPU Compute Pipeline */
-        if (!is_idr && encoder->has_ref && !ten_bit) {
+        if (!ten_bit) {
             if (encoder->enable_gpu_pipeline) {
                 gpu_compute_begin_picture(gpu_ctx, input_surface);
                 gpu_compute_dispatch_hevc_pipeline(gpu_ctx, input_surface, (int)encoder->width, (int)encoder->height, encoder->qp, is_idr ? 1 : 0);
                 gpu_compute_end_picture(gpu_ctx);
                 gpu_compute_sync(gpu_ctx);
 
-                void *mv_data = NULL;
-                size_t mv_size = 0;
-                if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0 && mv_data) {
-                    size_t total_cus = ((size_t)encoder->coded_width / HEVC_CU_SIZE) * (encoder->coded_height / HEVC_CU_SIZE);
-                    size_t max_bytes = total_cus * sizeof(gpu_mv_t);
-                    size_t copy_bytes = (mv_size < max_bytes) ? mv_size : max_bytes;
-                    memcpy(encoder->gpu_mvs, mv_data, copy_bytes);
-                    encoder->num_gpu_mvs = (uint32_t)(copy_bytes / sizeof(gpu_mv_t));
+                if (!is_idr && encoder->has_ref) {
+                    void *mv_data = NULL;
+                    size_t mv_size = 0;
+                    if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0 && mv_data) {
+                        size_t total_cus = ((size_t)encoder->coded_width / HEVC_CU_SIZE) * (encoder->coded_height / HEVC_CU_SIZE);
+                        size_t max_bytes = total_cus * sizeof(gpu_mv_t);
+                        size_t copy_bytes = (mv_size < max_bytes) ? mv_size : max_bytes;
+                        memcpy(encoder->gpu_mvs, mv_data, copy_bytes);
+                        encoder->num_gpu_mvs = (uint32_t)(copy_bytes / sizeof(gpu_mv_t));
+                    }
                 }
-            } else if (encoder->enable_gpu_me) {
+            } else if (encoder->enable_gpu_me && !is_idr && encoder->has_ref) {
                 gpu_compute_begin_picture(gpu_ctx, input_surface);
                 gpu_compute_dispatch_hevc_me(gpu_ctx, input_surface, (int)encoder->width, (int)encoder->height);
                 gpu_compute_end_picture(gpu_ctx);
