@@ -418,6 +418,11 @@ struct hevc_encoder {
     int16_t *mv_y_map;
     uint32_t last_frame_sad;
 
+    /* GPU compute motion vector readback for acceleration */
+    bool enable_gpu_me;
+    gpu_mv_t *gpu_mvs;
+    uint32_t num_gpu_mvs;
+
     /* Real per-4x4-luma-PU intra mode, for MPM derivation - one entry per
      * 4x4 position, persistent scratch (positional availability checks
      * gate every read, so stale cross-frame content is never read - see
@@ -646,6 +651,14 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
     }
     enc->mv_x_map = calloc(num_cus, sizeof(int16_t));
     enc->mv_y_map = calloc(num_cus, sizeof(int16_t));
+
+    const char *env_gpu_me = getenv("BC250_HEVC_GPU_ME");
+    enc->enable_gpu_me = (env_gpu_me && (strcmp(env_gpu_me, "1") == 0 || strcmp(env_gpu_me, "true") == 0));
+    enc->gpu_mvs = calloc(num_cus, sizeof(gpu_mv_t));
+    enc->num_gpu_mvs = 0;
+    if (enc->enable_gpu_me) {
+        fprintf(stderr, "[bc250-hevc] GPU compute motion estimation enabled (8x8 Wave64 compute shaders on 40 CUs)\n");
+    }
 
     enc->mode_map_stride = enc->coded_width / HEVC_PU_SIZE;
     enc->luma_mode_map = malloc((size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE));
@@ -899,6 +912,7 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
     for (int i = 0; i < encoder->num_slices; i++) free(encoder->slice_buf[i]);
     free(encoder->slice_rbsp);
     free(encoder->scratch_out);
+    free(encoder->gpu_mvs);
     for (int i = 0; i < 4; i++) free(encoder->hpel[i]);
     if (encoder->row_buf)
         for (uint32_t r = 0; r < encoder->height_ctu; r++) free(encoder->row_buf[r]);
@@ -1863,6 +1877,24 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
          * complete when it gets here: gpu_compute_video_proc() waits for
          * its own work, and an exported surface is waited for in
          * va_backend.c before the encode. */
+
+        /* Dedicated 8x8 HEVC GPU Motion Estimation (when enabled via BC250_HEVC_GPU_ME=1) */
+        if (encoder->enable_gpu_me && !is_idr && encoder->has_ref && !ten_bit) {
+            gpu_compute_begin_picture(gpu_ctx, input_surface);
+            gpu_compute_dispatch_hevc_me(gpu_ctx, input_surface, (int)encoder->width, (int)encoder->height);
+            gpu_compute_end_picture(gpu_ctx);
+            gpu_compute_sync(gpu_ctx);
+
+            void *mv_data = NULL;
+            size_t mv_size = 0;
+            if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0 && mv_data) {
+                size_t total_cus = ((size_t)encoder->coded_width / HEVC_CU_SIZE) * (encoder->coded_height / HEVC_CU_SIZE);
+                size_t max_bytes = total_cus * sizeof(gpu_mv_t);
+                size_t copy_bytes = (mv_size < max_bytes) ? mv_size : max_bytes;
+                memcpy(encoder->gpu_mvs, mv_data, copy_bytes);
+                encoder->num_gpu_mvs = (uint32_t)(copy_bytes / sizeof(gpu_mv_t));
+            }
+        }
 
         /* The pitches are in bytes, and a P010 row is two bytes a sample. */
         const int pitch = (int)encoder->width * (ten_bit ? 2 : 1);

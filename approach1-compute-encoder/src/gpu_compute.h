@@ -114,6 +114,7 @@ typedef struct bc250_gpu_context {
 
     /* Compute pipelines */
     VkPipeline motion_est_pipeline;
+    VkPipeline hevc_me_pipeline;
     VkPipeline predict_pipeline;
     VkPipeline transform_pipeline;
     VkPipeline quantize_pipeline;
@@ -592,6 +593,7 @@ int gpu_compute_dispatch_encode_ext(gpu_context_t *ctx, gpu_image_t render_targe
 /* Lightweight dispatch running ONLY Stage 2 (subgroup-accelerated Vulkan Motion Estimation)
  * without H.264 transform/quant/entropy stages. Used to accelerate HEVC inter frames on GPU. */
 int gpu_compute_dispatch_me_only(gpu_context_t *ctx, gpu_image_t render_target, int width, int height);
+int gpu_compute_dispatch_hevc_me(gpu_context_t *ctx, gpu_image_t render_target, int width, int height);
 double gpu_compute_get_last_latency_ms(const gpu_context_t *ctx);
 int gpu_compute_end_picture(gpu_context_t *ctx);
 int gpu_compute_sync(gpu_context_t *ctx);
