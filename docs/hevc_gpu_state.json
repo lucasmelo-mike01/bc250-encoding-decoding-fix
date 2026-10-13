@@ -1,0 +1,55 @@
+{
+  "mission": "HEVC_GPU_PIPELINE_BC250",
+  "updated_at": "2026-10-13 11:45:00",
+  "current_phase": "FINAL_AUDIT_COMPLETE",
+  "current_gate": "GATE_7",
+  "status": "SUCCESS",
+  "ceiling_reached": true,
+  "accumulated_cpu_gain_pct": 5.6,
+  "flags": {
+    "BC250_HEVC_GPU_ME": "ON",
+    "BC250_HEVC_GPU_TRANSFORM": "ON",
+    "BC250_HEVC_GPU_QUANT": "ON",
+    "BC250_HEVC_GPU_PRED": "ON",
+    "BC250_HEVC_GPU_FILTER": "ON",
+    "BC250_HEVC_GPU_PIPELINE": "ON",
+    "BC250_HEVC_FORCE_CPU": "OFF",
+    "BC250_HEVC_GPU_DEBUG": "OFF"
+  },
+  "prs": [
+    {
+      "pr_number": 60,
+      "url": "https://github.com/simpmix/bc250-encoding-decoding-fix/pull/60",
+      "title": "hevc: add dedicated Vulkan compute motion estimation for CTU 8x8 on BC-250",
+      "status": "OPEN"
+    },
+    {
+      "pr_number": 61,
+      "url": "https://github.com/simpmix/bc250-encoding-decoding-fix/pull/61",
+      "title": "feat(hevc): full Vulkan compute pipeline (stages 1-5) on AMD BC-250",
+      "status": "OPEN",
+      "latest_commit": "1819bfc"
+    }
+  ],
+  "benchmarks": {
+    "standalone_1080p60_fps": 84.8,
+    "standalone_1080p60_ms_per_frame": 11.79,
+    "standalone_1080p60_gpu_busy_pct": 23.7,
+    "standalone_1080p60_cpu_machine_pct": 34.9,
+    "obs_1080p30_real_fps": 30.0,
+    "obs_1080p30_gpu_busy_pct": 9.3,
+    "obs_1080p30_cpu_process_pct": 21.1
+  },
+  "verdict": "ARCHITECTURAL_CEILING_REACHED",
+  "audit_evidence": {
+    "atomic_dispatches": {
+      "me": 59,
+      "transform": 60,
+      "quant": 60,
+      "recon": 60
+    },
+    "zero_nal_warnings": true,
+    "ctest_pass_rate": "10/10 (100%)",
+    "h264_regression": "PASS"
+  }
+}
