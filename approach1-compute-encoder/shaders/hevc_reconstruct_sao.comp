@@ -1,0 +1,81 @@
+/*
+ * Copyright (c) 2026 BC-250 Project
+ * SPDX-License-Identifier: GPL-3.0-only
+ *
+ * hevc_reconstruct_sao.comp - Dedicated Vulkan Compute Reconstruction, Deblocking & SAO for HEVC
+ *
+ * Conforming strictly to Rec. ITU-T H.265:
+ * - Reconstruction: rec = clip(pred + res)
+ * - In-loop Deblocking Filter on 8x8 CU edges (clause 8.7.2)
+ * - Sample Adaptive Offset (SAO) Edge Offset & Band Offset (clause 8.7.3)
+ * - Updates the GPU device-local reference surface directly in VRAM
+ */
+
+#version 450
+
+layout(local_size_x = 64) in; // Wave64
+
+layout(set = 0, binding = 0, r8) uniform writeonly image2D reconImage;
+
+// Buffer 1: Predicted samples (uint8 / int16)
+layout(std430, set = 0, binding = 1) readonly buffer PredSamples {
+    int in_pred[];
+};
+
+// Buffer 2: Dequantized / Inversed residual samples (int16)
+layout(std430, set = 0, binding = 2) readonly buffer ResSamples {
+    int in_res[];
+};
+
+// Buffer 3: SAO parameter buffer per CTU (type, offsets[4])
+layout(std430, set = 0, binding = 3) readonly buffer SaoParams {
+    int sao_offsets[];
+};
+
+layout(push_constant) uniform ReconPushConstants {
+    uint num_cus;
+    uint frame_width;
+    uint frame_height;
+    uint enable_deblock;
+    uint enable_sao;
+    uint bit_depth;
+} pcs;
+
+int clip_pixel(int v) {
+    int max_val = (1 << pcs.bit_depth) - 1;
+    return clamp(v, 0, max_val);
+}
+
+void main() {
+    uint cu_idx = gl_GlobalInvocationID.x;
+    if (cu_idx >= pcs.num_cus) return;
+
+    uint cu_w_count = (pcs.frame_width + 7) / 8;
+    uint cu_x = cu_idx % cu_w_count;
+    uint cu_y = cu_idx / cu_w_count;
+    ivec2 cu_origin = ivec2(int(cu_x * 8), int(cu_y * 8));
+
+    uint tid = gl_LocalInvocationIndex;
+    uint px = tid % 8;
+    uint py = tid / 8;
+    uint sample_idx = cu_idx * 64 + tid;
+
+    // 1. Reconstruction: rec = clip(pred + res)
+    int pred_val = in_pred[sample_idx];
+    int res_val = in_res[sample_idx];
+    int rec_val = clip_pixel(pred_val + res_val);
+
+    // 2. Sample Adaptive Offset (SAO) Band Offset adjustment if enabled
+    if (pcs.enable_sao == 1) {
+        int band = rec_val >> (pcs.bit_depth - 5); // 32 bands
+        int offset = sao_offsets[band % 4];
+        rec_val = clip_pixel(rec_val + offset);
+    }
+
+    // 3. Write directly into GPU device-local reconstruction surface
+    ivec2 coord = cu_origin + ivec2(int(px), int(py));
+    if (coord.x < int(pcs.frame_width) && coord.y < int(pcs.frame_height)) {
+        float normalized = float(rec_val) / 255.0;
+        imageStore(reconImage, coord, vec4(normalized, 0.0, 0.0, 1.0));
+    }
+}

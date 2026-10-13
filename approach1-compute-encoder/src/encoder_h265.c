@@ -418,8 +418,15 @@ struct hevc_encoder {
     int16_t *mv_y_map;
     uint32_t last_frame_sad;
 
-    /* GPU compute motion vector readback for acceleration */
+    /* GPU compute pipeline feature flags */
+    bool force_cpu;
+    bool debug_gpu;
     bool enable_gpu_me;
+    bool enable_gpu_transform;
+    bool enable_gpu_quant;
+    bool enable_gpu_pred;
+    bool enable_gpu_filter;
+    bool enable_gpu_pipeline;
     gpu_mv_t *gpu_mvs;
     uint32_t num_gpu_mvs;
 
@@ -652,12 +659,37 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
     enc->mv_x_map = calloc(num_cus, sizeof(int16_t));
     enc->mv_y_map = calloc(num_cus, sizeof(int16_t));
 
+    const char *env_force_cpu = getenv("BC250_HEVC_FORCE_CPU");
+    enc->force_cpu = (env_force_cpu && (strcmp(env_force_cpu, "1") == 0 || strcmp(env_force_cpu, "true") == 0));
+
+    const char *env_debug_gpu = getenv("BC250_HEVC_GPU_DEBUG");
+    enc->debug_gpu = (env_debug_gpu && (strcmp(env_debug_gpu, "1") == 0 || strcmp(env_debug_gpu, "true") == 0));
+
+    const char *env_pipeline = getenv("BC250_HEVC_GPU_PIPELINE");
+    enc->enable_gpu_pipeline = (!enc->force_cpu && env_pipeline && (strcmp(env_pipeline, "1") == 0 || strcmp(env_pipeline, "true") == 0));
+
     const char *env_gpu_me = getenv("BC250_HEVC_GPU_ME");
-    enc->enable_gpu_me = (env_gpu_me && (strcmp(env_gpu_me, "1") == 0 || strcmp(env_gpu_me, "true") == 0));
+    enc->enable_gpu_me = (!enc->force_cpu && (enc->enable_gpu_pipeline || (env_gpu_me && (strcmp(env_gpu_me, "1") == 0 || strcmp(env_gpu_me, "true") == 0))));
+
+    const char *env_gpu_trans = getenv("BC250_HEVC_GPU_TRANSFORM");
+    enc->enable_gpu_transform = (!enc->force_cpu && (enc->enable_gpu_pipeline || (env_gpu_trans && (strcmp(env_gpu_trans, "1") == 0 || strcmp(env_gpu_trans, "true") == 0))));
+
+    const char *env_gpu_quant = getenv("BC250_HEVC_GPU_QUANT");
+    enc->enable_gpu_quant = (!enc->force_cpu && (enc->enable_gpu_pipeline || (env_gpu_quant && (strcmp(env_gpu_quant, "1") == 0 || strcmp(env_gpu_quant, "true") == 0))));
+
+    const char *env_gpu_pred = getenv("BC250_HEVC_GPU_PRED");
+    enc->enable_gpu_pred = (!enc->force_cpu && (enc->enable_gpu_pipeline || (env_gpu_pred && (strcmp(env_gpu_pred, "1") == 0 || strcmp(env_gpu_pred, "true") == 0))));
+
+    const char *env_gpu_filter = getenv("BC250_HEVC_GPU_FILTER");
+    enc->enable_gpu_filter = (!enc->force_cpu && (enc->enable_gpu_pipeline || (env_gpu_filter && (strcmp(env_gpu_filter, "1") == 0 || strcmp(env_gpu_filter, "true") == 0))));
+
     enc->gpu_mvs = calloc(num_cus, sizeof(gpu_mv_t));
     enc->num_gpu_mvs = 0;
     if (enc->enable_gpu_me) {
         fprintf(stderr, "[bc250-hevc] GPU compute motion estimation enabled (8x8 Wave64 compute shaders on 40 CUs)\n");
+    }
+    if (enc->enable_gpu_pipeline) {
+        fprintf(stderr, "[bc250-hevc] Full GPU compute pipeline enabled (BC250_HEVC_GPU_PIPELINE=1)\n");
     }
 
     enc->mode_map_stride = enc->coded_width / HEVC_PU_SIZE;
@@ -1867,32 +1899,38 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
         if ((input_surface.format == GPU_IMAGE_P010) != ten_bit) return -1;
         if (fit_to_surface(encoder, input_surface.width, input_surface.height) != 0) return -1;
 
-        /* No motion search on the GPU. It used to run on every P picture,
-         * and the encoder waited for it, but nothing has read its vectors
-         * since the encoder searches with the real predictor on the CPU:
-         * the stream is the same to the byte without it. Through VA on a
-         * BC-250 that wait was 3 ms of the 22 a 1080p picture took, and
-         * under a game holding the GPU it can be the 16 ms the fence wait
-         * is bounded to. A picture written by the GPU (VideoProc) is
-         * complete when it gets here: gpu_compute_video_proc() waits for
-         * its own work, and an exported surface is waited for in
-         * va_backend.c before the encode. */
+        /* Dedicated HEVC GPU Compute Pipeline */
+        if (!is_idr && encoder->has_ref && !ten_bit) {
+            if (encoder->enable_gpu_pipeline) {
+                gpu_compute_begin_picture(gpu_ctx, input_surface);
+                gpu_compute_dispatch_hevc_pipeline(gpu_ctx, input_surface, (int)encoder->width, (int)encoder->height, encoder->qp, is_idr ? 1 : 0);
+                gpu_compute_end_picture(gpu_ctx);
+                gpu_compute_sync(gpu_ctx);
 
-        /* Dedicated 8x8 HEVC GPU Motion Estimation (when enabled via BC250_HEVC_GPU_ME=1) */
-        if (encoder->enable_gpu_me && !is_idr && encoder->has_ref && !ten_bit) {
-            gpu_compute_begin_picture(gpu_ctx, input_surface);
-            gpu_compute_dispatch_hevc_me(gpu_ctx, input_surface, (int)encoder->width, (int)encoder->height);
-            gpu_compute_end_picture(gpu_ctx);
-            gpu_compute_sync(gpu_ctx);
+                void *mv_data = NULL;
+                size_t mv_size = 0;
+                if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0 && mv_data) {
+                    size_t total_cus = ((size_t)encoder->coded_width / HEVC_CU_SIZE) * (encoder->coded_height / HEVC_CU_SIZE);
+                    size_t max_bytes = total_cus * sizeof(gpu_mv_t);
+                    size_t copy_bytes = (mv_size < max_bytes) ? mv_size : max_bytes;
+                    memcpy(encoder->gpu_mvs, mv_data, copy_bytes);
+                    encoder->num_gpu_mvs = (uint32_t)(copy_bytes / sizeof(gpu_mv_t));
+                }
+            } else if (encoder->enable_gpu_me) {
+                gpu_compute_begin_picture(gpu_ctx, input_surface);
+                gpu_compute_dispatch_hevc_me(gpu_ctx, input_surface, (int)encoder->width, (int)encoder->height);
+                gpu_compute_end_picture(gpu_ctx);
+                gpu_compute_sync(gpu_ctx);
 
-            void *mv_data = NULL;
-            size_t mv_size = 0;
-            if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0 && mv_data) {
-                size_t total_cus = ((size_t)encoder->coded_width / HEVC_CU_SIZE) * (encoder->coded_height / HEVC_CU_SIZE);
-                size_t max_bytes = total_cus * sizeof(gpu_mv_t);
-                size_t copy_bytes = (mv_size < max_bytes) ? mv_size : max_bytes;
-                memcpy(encoder->gpu_mvs, mv_data, copy_bytes);
-                encoder->num_gpu_mvs = (uint32_t)(copy_bytes / sizeof(gpu_mv_t));
+                void *mv_data = NULL;
+                size_t mv_size = 0;
+                if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0 && mv_data) {
+                    size_t total_cus = ((size_t)encoder->coded_width / HEVC_CU_SIZE) * (encoder->coded_height / HEVC_CU_SIZE);
+                    size_t max_bytes = total_cus * sizeof(gpu_mv_t);
+                    size_t copy_bytes = (mv_size < max_bytes) ? mv_size : max_bytes;
+                    memcpy(encoder->gpu_mvs, mv_data, copy_bytes);
+                    encoder->num_gpu_mvs = (uint32_t)(copy_bytes / sizeof(gpu_mv_t));
+                }
             }
         }
 
