@@ -117,6 +117,8 @@ typedef struct bc250_gpu_context {
     VkPipeline hevc_me_pipeline;
     VkPipeline hevc_transform_pipeline;
     VkPipeline hevc_quant_pipeline;
+    VkPipeline hevc_pred_pipeline;
+    VkPipeline hevc_reconstruct_sao_pipeline;
     VkPipeline predict_pipeline;
     VkPipeline transform_pipeline;
     VkPipeline quantize_pipeline;
@@ -598,6 +600,7 @@ int gpu_compute_dispatch_me_only(gpu_context_t *ctx, gpu_image_t render_target, 
 int gpu_compute_dispatch_hevc_me(gpu_context_t *ctx, gpu_image_t render_target, int width, int height);
 int gpu_compute_dispatch_hevc_transform(gpu_context_t *ctx, int num_blocks, int transform_size, int is_dst, int bit_depth);
 int gpu_compute_dispatch_hevc_quant(gpu_context_t *ctx, int num_blocks, int log2_size, int qp, int bit_depth);
+int gpu_compute_dispatch_hevc_pipeline(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_idr);
 double gpu_compute_get_last_latency_ms(const gpu_context_t *ctx);
 int gpu_compute_end_picture(gpu_context_t *ctx);
 int gpu_compute_sync(gpu_context_t *ctx);
